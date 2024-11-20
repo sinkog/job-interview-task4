@@ -1,0 +1,149 @@
+---
+- name: Jenkins és Docker registry telepítése
+  hosts: target
+  become: yes
+  vars:
+    github_token: "<github_personal_access_token>"
+    github_username: "<github_username>"
+    repo_name: "hello-world-app"
+    registry_name: "my-registry"
+    registry_ui_name: "registry-ui"
+    registry_port: 5000
+    registry_ui_port: 8080
+    jenkins_port: 8081
+    worker_name: "jenkins-worker"
+    pipeline_file: /tmp/Jenkinsfile
+
+  tasks:
+
+    # Docker telepítése
+    - name: Docker telepítése
+      apt:
+        name:
+          - docker.io
+          - docker-compose
+        state: present
+        update_cache: yes
+
+    # Docker Registry és UI telepítése
+    - name: Docker Registry és UI indítása
+      docker_container:
+        name: "{{ item.name }}"
+        image: "{{ item.image }}"
+        ports:
+          - "{{ item.port }}"
+        state: started
+        restart_policy: always
+      with_items:
+        - { name: "{{ registry_name }}", image: "registry:2", port: "{{ registry_port }}:5000" }
+        - { name: "{{ registry_ui_name }}", image: "jc21/registry-ui", port: "{{ registry_ui_port }}:80" }
+      loop_control:
+        label: "{{ item.name }}"
+
+    # Jenkins telepítése és worker létrehozása
+    - name: Jenkins Master indítása
+      docker_container:
+        name: jenkins-master
+        image: jenkins/jenkins:lts
+        ports:
+          - "{{ jenkins_port }}:8080"
+        state: started
+        restart_policy: always
+
+    - name: Jenkins Worker indítása
+      docker_container:
+        name: "{{ worker_name }}"
+        image: jenkins/inbound-agent
+        state: started
+        restart_policy: always
+
+    # GitHub privát repository létrehozása
+    - name: Privát repository létrehozása GitHubon
+      uri:
+        url: "https://api.github.com/user/repos"
+        method: POST
+        headers:
+          Authorization: "token {{ github_token }}"
+        body: |
+          {
+            "name": "{{ repo_name }}",
+            "private": true
+          }
+        status_code: 201
+
+    # Hello World projekt és Dockerfile létrehozása
+    - name: Hello World alkalmazás előkészítése
+      copy:
+        dest: /tmp/{{ repo_name }}
+        content: |
+          FROM python:3.9-slim
+          COPY app.py /app.py
+          CMD ["python", "app.py"]
+        remote_src: no
+
+    - name: Hello World Python fájl létrehozása
+      copy:
+        dest: /tmp/{{ repo_name }}/app.py
+        content: |
+          from flask import Flask
+          app = Flask(__name__)
+
+          @app.route("/")
+          def hello():
+              return "Hello, World!"
+
+          if __name__ == "__main__":
+              app.run(host="0.0.0.0", port=80)
+
+    # Projekt feltöltése GitHubra
+    - name: GitHub repository inicializálása és feltöltése
+      shell: |
+        cd /tmp/{{ repo_name }}
+        git init
+        git remote add origin https://github.com/{{ github_username }}/{{ repo_name }}.git
+        git add .
+        git commit -m "Initial commit"
+        git branch -M main
+        git push -u origin main
+      args:
+        executable: /bin/bash
+
+    # Jenkins Pipeline létrehozása
+    - name: Jenkinsfile létrehozása
+      copy:
+        dest: "{{ pipeline_file }}"
+        content: |
+          pipeline {
+              agent any
+              stages {
+                  stage('Clone') {
+                      steps {
+                          git 'https://github.com/{{ github_username }}/{{ repo_name }}.git'
+                      }
+                  }
+                  stage('Build') {
+                      steps {
+                          sh 'docker build -t {{ registry_name }}/{{ repo_name }} .'
+                      }
+                  }
+                  stage('Push') {
+                      steps {
+                          sh 'docker tag {{ registry_name }}/{{ repo_name }} localhost:{{ registry_port }}/{{ repo_name }}'
+                          sh 'docker push localhost:{{ registry_port }}/{{ repo_name }}'
+                      }
+                  }
+                  stage('Deploy') {
+                      steps {
+                          sh 'docker run -d -p 8082:80 localhost:{{ registry_port }}/{{ repo_name }}'
+                      }
+                  }
+              }
+          }
+
+    # Jenkins job hozzáadása a Pipeline-hoz
+    - name: Jenkins job konfigurálása
+      shell: |
+        curl -X POST -H "Content-Type:application/xml"         --data-binary "@{{ pipeline_file }}"         http://localhost:{{ jenkins_port }}/createItem?name={{ repo_name }}
+      args:
+        executable: /bin/bash
+
